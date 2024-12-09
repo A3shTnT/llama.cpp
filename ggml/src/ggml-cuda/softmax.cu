@@ -11,6 +11,75 @@ __device__ float __forceinline__ t2f32<half>(half val) {
     return __half2float(val);
 }
 
+template <int split_n_rows, int split_n_cols, int t_n_cols, typename T>
+static __global__ __launch_bounds__(128, 1) void soft_max_4x32_f32(const float * x, const T * mask, float * dst,
+                                                                   const float scale, const float max_bias,
+                                                                   const float m0, const float m1, uint32_t n_head_log2,
+                                                                   int64_t ne00, int64_t ne01, size_t nb01, size_t nb02,
+                                                                   size_t nb03) {
+    const int tid  = threadIdx.x;
+    const int wid  = tid / warpSize;
+    const int wtid = tid % warpSize;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+    const int bidz = blockIdx.z;
+
+    const int n_cols = t_n_cols == 0 ? ne00 : t_n_cols;
+
+    const float slope = get_alibi_slope(max_bias, bidy, n_head_log2, m0, m1);
+
+    extern __shared__ float smem_softmax[];
+
+    const float * x_block    = (const float *) ((char *) x + bidx * nb03 + bidy * nb02 + bidz * split_n_rows * nb01);
+    const T *     mask_block = mask + bidz * split_n_rows * n_cols;
+    float *       dst_block  = (float *) ((char *) dst + bidx * nb03 + bidy * nb02 + bidz * split_n_rows * nb01);
+
+    const size_t stride_x       = nb01 / sizeof(float);
+    const size_t stride_mask    = n_cols;
+    const size_t stride_softmax = ((ne00 + 31) & (~31));
+    const size_t stride_dst     = stride_x;
+
+    float maxf = -INFINITY;
+
+#pragma unroll
+    for (int i = wtid; i < n_cols; i += split_n_cols) {
+        float rx    = -INFINITY;
+        T     rmask = 0;
+        if (bidz * split_n_rows + wid < ne01 && i < n_cols) {
+            rx = x_block[wid * stride_x + i];
+            if (mask) {
+                rmask = mask_block[wid * stride_mask + i];
+            }
+        }
+        float val                              = rx * scale + slope * t2f32(rmask);
+        smem_softmax[wid * stride_softmax + i] = val;
+        maxf                                   = max(maxf, val);
+    }
+
+    maxf       = warp_reduce_max(maxf);
+    float sumf = 0.0f;
+
+    __syncthreads();
+
+#pragma unroll
+    for (int i = wtid; i < n_cols; i += split_n_cols) {
+        float val = expf(smem_softmax[wid * stride_softmax + i] - maxf);
+        sumf += val;
+        smem_softmax[wid * stride_softmax + i] = val;
+    }
+
+    sumf = warp_reduce_sum(sumf);
+
+#pragma unroll
+    for (int i = wtid; i < n_cols; i += split_n_cols) {
+        float  val   = smem_softmax[wid * stride_softmax + i] / sumf;
+        size_t index = wid * stride_dst + i;
+        if (bidz * split_n_rows + wid < ne01 && i < n_cols) {
+            dst_block[index] = val;
+        }
+    }
+}
+
 template <bool vals_smem, int ncols_template, int block_size_template, typename T>
 static __global__ void soft_max_f32(const float * x, const T * mask, float * dst, const int ncols_par, const int nrows_y, const float scale, const float max_bias, const float m0, const float m1, uint32_t n_head_log2) {
     const int ncols = ncols_template == 0 ? ncols_par : ncols_template;
@@ -115,8 +184,11 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     }
 }
 
-template<typename T>
-static void soft_max_f32_cuda(const float * x, const T * mask, float * dst, const int ncols_x, const int nrows_x, const int nrows_y, const float scale, const float max_bias, cudaStream_t stream) {
+template <typename T>
+static void soft_max_f32_cuda(const float * x, const T * mask, float * dst, const int ncols_x, const int nrows_x,
+                              const int nrows_y, const size_t ne02, const size_t ne03, const size_t nb01,
+                              const size_t nb02, const size_t nb03, const float scale, const float max_bias,
+                              cudaStream_t stream) {
     int nth = WARP_SIZE;
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
@@ -130,8 +202,56 @@ static void soft_max_f32_cuda(const float * x, const T * mask, float * dst, cons
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
+    const int split_n_rows = 4;
+
+    if (split_n_rows * shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+        const int    ne00      = ncols_x;
+        const int    ne01      = nrows_y;
+        const size_t smem_size = split_n_rows * shmem;
+        const int    threads   = 128;
+        const dim3   blocks(ne03, ne02, (ne01 + split_n_rows - 1) / split_n_rows);
+        switch (ne00) {
+            case 32:
+                soft_max_4x32_f32<4, 32, 32><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 64:
+                soft_max_4x32_f32<4, 32, 64><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 128:
+                soft_max_4x32_f32<4, 32, 128><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 256:
+                soft_max_4x32_f32<4, 32, 256><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 512:
+                soft_max_4x32_f32<4, 32, 512><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 1024:
+                soft_max_4x32_f32<4, 32, 1024><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 2048:
+                soft_max_4x32_f32<4, 32, 2048><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            case 4096:
+                soft_max_4x32_f32<4, 32, 4096><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+            default:
+                soft_max_4x32_f32<4, 32, 0><<<blocks, threads, smem_size, stream>>>(
+                    x, mask, dst, scale, max_bias, m0, m1, n_head_log2, ne00, ne01, nb01, nb02, nb03);
+                break;
+        }
+    }
+
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
-    if (shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
+    else if (shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb) {
         switch (ncols_x) {
             case 32:
                 soft_max_f32<true, 32, 32><<<block_nums, block_dims, shmem, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2);
@@ -181,10 +301,16 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
     GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32); // src1 contains mask and it is optional
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
 
     const int64_t ne00    = src0->ne[0];
     const int64_t nrows_x = ggml_nrows(src0);
     const int64_t nrows_y = src0->ne[1];
+    const int64_t ne02    = src0->ne[2];
+    const int64_t ne03    = src0->ne[3];
+    const size_t  nb01    = src0->nb[1];
+    const size_t  nb02    = src0->nb[2];
+    const size_t  nb03    = src0->nb[3];
 
     float scale    = 1.0f;
     float max_bias = 0.0f;
@@ -197,10 +323,12 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (use_f16) {
         const half * src1_dd = (const half *)src1_d;
 
-        soft_max_f32_cuda(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, scale, max_bias, stream);
+        soft_max_f32_cuda(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, ne02, ne03, nb01, nb02, nb03, scale, max_bias,
+                          stream);
     } else {
         const float * src1_dd = (const float *)src1_d;
 
-        soft_max_f32_cuda(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, scale, max_bias, stream);
+        soft_max_f32_cuda(src0_d, src1_dd, dst_d, ne00, nrows_x, nrows_y, ne02, ne03, nb01, nb02, nb03, scale, max_bias,
+                          stream);
     }
 }
