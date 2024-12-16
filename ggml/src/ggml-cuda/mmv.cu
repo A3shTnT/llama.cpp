@@ -2,12 +2,12 @@
 #include "mmv.cuh"
 
 template <typename type_acc, int64_t template_cols2>
-static __global__ void mul_mat_vec(const half * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
-                                   const int64_t nrows, const int64_t ncols2, const int64_t stride_row,
-                                   const int64_t channel_ratio, const int64_t stride_channel_x,
-                                   const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+static __global__ void __launch_bounds__(256, 2)
+    mul_mat_vec(const half * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+                const int64_t nrows, const int64_t ncols2, const int64_t stride_row, const int64_t channel_ratio,
+                const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst) {
     const int64_t n_cols2   = template_cols2 == 0 ? ncols2 : template_cols2;
-    const int     block_row = 4;
+    const int     block_row = 8;
 
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
@@ -25,13 +25,21 @@ static __global__ void mul_mat_vec(const half * __restrict__ x, const float * __
 
     float sumf = 0.0f;
 
+    // float2 rx[2] = {
+    //     { 0.0f, 0.0f },
+    //     { 0.0f, 0.0f }
+    // };
+    float2 tmpx = { 0.0f, 0.0f };
+    float2 tmpy = { 0.0f, 0.0f };
+
 #pragma unroll
     for (int64_t i = wtid; i < n_cols2; i += WARP_SIZE) {
-        float2 tmpx = { 0.0f, 0.0f };
-        float2 tmpy = { 0.0f, 0.0f };
         if (i < n_cols2 && bidy * block_row + wid < nrows) {
             tmpx = __half22float2(block_x2[wid * stride_row / 2 + i]);
             tmpy = block_y2[i];
+        } else {
+            tmpx = { 0.0f, 0.0f };
+            tmpy = { 0.0f, 0.0f };
         }
 
         sumf += tmpx.x * tmpy.x;
@@ -57,9 +65,9 @@ static void launch_mul_mat_vec_cuda(const half * x, const float * y, float * dst
 
     const int64_t channel_ratio = nchannels_y / nchannels_x;
 
-    const int block_row = 4;
+    const int block_row = 8;
 
-    int64_t block_size = 128;
+    int64_t block_size = 256;
 
     const dim3 block_nums(nchannels_y, (nrows + block_row - 1) / block_row, 1);
     const dim3 block_dims(block_size, 1, 1);
