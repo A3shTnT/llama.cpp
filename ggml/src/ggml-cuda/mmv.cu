@@ -1,6 +1,66 @@
 #include "common.cuh"
 #include "mmv.cuh"
 
+__forceinline__ __device__ void ld128_prefetch(float4 * dst, const float4 * src) {
+    asm volatile("ld.global.L2::128B.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=f"(dst->x), "=f"(dst->y), "=f"(dst->z), "=f"(dst->w)
+                 : "l"(src));
+}
+
+template <typename type_acc, int64_t template_cols2>
+static __global__ void __launch_bounds__(256, 2)
+    mul_mat_vec_x4(const half * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+                   const int64_t nrows, const int64_t ncols2, const int64_t stride_row, const int64_t channel_ratio,
+                   const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+    const int64_t n_cols2   = template_cols2;
+    const int     block_row = 8;
+
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+
+    const int tid  = threadIdx.x;
+    const int wid  = tid / WARP_SIZE;
+    const int wtid = tid % WARP_SIZE;
+
+    const half *  block_x   = x + (bidx / channel_ratio) * stride_channel_x + bidy * block_row * stride_row;
+    const float * block_y   = y + bidx * stride_channel_y;
+    float *       block_dst = dst + bidx * stride_channel_dst + bidy * block_row;
+
+    const float4 * block_x_half2_x4 = (const float4 *) block_x;
+    const float4 * block_y_float_x4 = (const float4 *) block_y;
+
+    float sumf = 0.0f;
+
+    float4 rx   = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float4 ry_0 = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float4 ry_1 = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+#pragma unroll
+    for (int64_t i = wtid; i < n_cols2 / 4; i += WARP_SIZE) {
+        if (i < n_cols2 / 4 && bidy * block_row + wid < nrows) {
+            ld128_prefetch(&rx, block_x_half2_x4 + wid * stride_row / 8 + i);
+            ld128_prefetch(&ry_0, block_y_float_x4 + i * 2);
+            ld128_prefetch(&ry_1, block_y_float_x4 + i * 2 + 1);
+        } else {
+            rx   = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ry_0 = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ry_1 = { 0.0f, 0.0f, 0.0f, 0.0f };
+        }
+        float2 tmpx[4] = { __half22float2(*(half2 *) (&rx.x)), __half22float2(*(half2 *) (&rx.y)),
+                           __half22float2(*(half2 *) (&rx.z)), __half22float2(*(half2 *) (&rx.w)) };
+        sumf += tmpx[0].x * ry_0.x + tmpx[0].y * ry_0.y;
+        sumf += tmpx[1].x * ry_0.z + tmpx[1].y * ry_0.w;
+        sumf += tmpx[2].x * ry_1.x + tmpx[2].y * ry_1.y;
+        sumf += tmpx[3].x * ry_1.z + tmpx[3].y * ry_1.w;
+    }
+
+    sumf = warp_reduce_sum(sumf);
+
+    if (wtid == 0 && bidy * block_row + wid < nrows) {
+        block_dst[wid] = sumf;
+    }
+}
+
 template <typename type_acc, int64_t template_cols2>
 static __global__ void __launch_bounds__(256, 2)
     mul_mat_vec(const half * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
@@ -25,10 +85,6 @@ static __global__ void __launch_bounds__(256, 2)
 
     float sumf = 0.0f;
 
-    // float2 rx[2] = {
-    //     { 0.0f, 0.0f },
-    //     { 0.0f, 0.0f }
-    // };
     float2 tmpx = { 0.0f, 0.0f };
     float2 tmpy = { 0.0f, 0.0f };
 
@@ -74,67 +130,49 @@ static void launch_mul_mat_vec_cuda(const half * x, const float * y, float * dst
 
     switch (ncols) {
         case 32:
-            {
-                mul_mat_vec<type_acc, 16>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec<type_acc, 16><<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row,
+                                                                             channel_ratio, stride_channel_x,
+                                                                             stride_channel_y, stride_channel_dst);
             break;
         case 64:
-            {
-                mul_mat_vec<type_acc, 32>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec<type_acc, 32><<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row,
+                                                                             channel_ratio, stride_channel_x,
+                                                                             stride_channel_y, stride_channel_dst);
             break;
         case 128:
-            {
-                mul_mat_vec<type_acc, 64>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec<type_acc, 64><<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row,
+                                                                             channel_ratio, stride_channel_x,
+                                                                             stride_channel_y, stride_channel_dst);
             break;
         case 256:
-            {
-                mul_mat_vec<type_acc, 128>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec_x4<type_acc, 128>
+                <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
+                                                        stride_channel_x, stride_channel_y, stride_channel_dst);
             break;
         case 512:
-            {
-                mul_mat_vec<type_acc, 256>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec_x4<type_acc, 256>
+                <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
+                                                        stride_channel_x, stride_channel_y, stride_channel_dst);
             break;
         case 1024:
-            {
-                mul_mat_vec<type_acc, 512>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            };
+            mul_mat_vec_x4<type_acc, 512>
+                <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
+                                                        stride_channel_x, stride_channel_y, stride_channel_dst);
             break;
         case 2048:
-            {
-                mul_mat_vec<type_acc, 1024>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec_x4<type_acc, 1024>
+                <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
+                                                        stride_channel_x, stride_channel_y, stride_channel_dst);
             break;
         case 4096:
-            {
-                mul_mat_vec<type_acc, 2048>
-                    <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
-                                                            stride_channel_x, stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec_x4<type_acc, 2048>
+                <<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row, channel_ratio,
+                                                        stride_channel_x, stride_channel_y, stride_channel_dst);
             break;
         default:
-            {
-                mul_mat_vec<type_acc, 0><<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row,
-                                                                                channel_ratio, stride_channel_x,
-                                                                                stride_channel_y, stride_channel_dst);
-            }
+            mul_mat_vec<type_acc, 0><<<block_nums, block_dims, 0, stream>>>(x, y, dst, nrows, ncols / 2, stride_row,
+                                                                            channel_ratio, stride_channel_x,
+                                                                            stride_channel_y, stride_channel_dst);
             break;
     }
 }
